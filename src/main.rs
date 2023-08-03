@@ -1,3 +1,5 @@
+mod input;
+
 extern crate sdl2;
 
 use std::collections::hash_map::RandomState;
@@ -10,16 +12,17 @@ use std::process;
 use std::thread::current;
 use std::{thread, time};
 
+use input::{Input, Keys};
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
-use sdl2::libc::free;
+use sdl2::libc::{free, intptr_t};
 use sdl2::pixels::Color;
 use sdl2::rect::{Point, Rect};
 use sdl2::render::Canvas;
 use sdl2::sys::random;
 use sdl2::video::Window;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const C8_DISPLAY_WIDTH: usize = 64;
 const C8_DISPLAY_HEIGHT: usize = 32;
@@ -27,6 +30,7 @@ const C8_RAM_SIZE: usize = 4096;
 const C8_STACK_SIZE: usize = 16;
 const C8_PROGRAM_START: usize = 0x200;
 const SCALE_FACTOR: usize = 8;
+const CYCLES_PER_SECOND: u64 = 1_000_000;
 
 use rand::prelude::*;
 
@@ -82,6 +86,20 @@ impl Chip8 {
         }
     }
 
+    pub fn proceed(&mut self, key_events: &Keys) {
+        if self.delay_timer > 0 {
+            self.delay_timer -= 1;
+        }
+
+        if self.sound_timer > 0 {
+            self.sound_timer -= 1;
+        }
+
+        let opcode = self.fetch();
+        println!("Instruction: {opcode:x?}");
+        self.decode(opcode, key_events);
+    }
+
     pub fn load_program(&mut self, file_path: &String) {
         let buffer: Vec<u8> = read_program(file_path).unwrap_or_else(|err| {
             println!("Can't read input file: {err}");
@@ -99,7 +117,7 @@ impl Chip8 {
         instr
     }
 
-    fn decode(&mut self, instr: u16) {
+    fn decode(&mut self, instr: u16, key_events: &Keys) {
         /*
         Instr = 0xABCD
         then:
@@ -138,12 +156,12 @@ impl Chip8 {
             0x8 => self.match_arithmatic(x, y, n),
             0x9 => self.skipr_ne(x, y),
             0xA => self.set_idx(nnn),
-            // 0xB => (),
+            0xB => self.jump_offset(x, nn),
             0xC => self.random_and(x, nn),
             0xD => self.display(x, y, n),
             0xE => match nn {
-                0x9E => self.skip_if_key(x),
-                0xA1 => self.skip_if_not_key(x),
+                0x9E => self.skip_if_key(x, key_events),
+                0xA1 => self.skip_if_not_key(x, key_events),
                 _ => {
                     println!("Error: Unimplemented opcode {instr_type}");
                     process::exit(1);
@@ -209,6 +227,10 @@ impl Chip8 {
         self.pc = operand as usize;
     }
 
+    fn jump_offset(&mut self, register: u8, operand: u8) {
+        self.pc = (operand + self.registers[register as usize]) as usize;
+    }
+
     fn call(&mut self, operand: u16) {
         self.stack[self.sp as usize] = self.pc as u16;
         self.sp += 1;
@@ -233,7 +255,8 @@ impl Chip8 {
     }
 
     fn add(&mut self, register: u8, operand: u8) {
-        self.registers[register as usize] = operand.wrapping_add(self.registers[register as usize]);
+        let result = operand.wrapping_add(self.registers[register as usize]);
+        self.registers[register as usize] = result;
     }
 
     fn add_r(&mut self, r1: u8, r2: u8) {
@@ -242,55 +265,55 @@ impl Chip8 {
 
         let res: u16 = lhs as u16 + rhs as u16;
 
+        self.registers[r1 as usize] = lhs.wrapping_add(rhs);
+
         if res > 255 {
             self.registers[0xF] = 1;
         } else {
             self.registers[0xF] = 0;
         }
-
-        self.registers[r1 as usize] = lhs.wrapping_add(rhs);
     }
 
     fn subtract_left(&mut self, r1: u8, r2: u8) {
         let minuend = self.registers[r2 as usize];
         let subtrahend = self.registers[r1 as usize];
 
+        self.registers[r1 as usize] = minuend.wrapping_sub(subtrahend);
+
         if minuend > subtrahend {
             self.registers[0xF] = 1;
         } else {
             self.registers[0xF] = 0;
         }
-
-        self.registers[r1 as usize] = minuend.wrapping_sub(subtrahend);
     }
 
     fn subtract_right(&mut self, r1: u8, r2: u8) {
         let minuend = self.registers[r1 as usize];
         let subtrahend = self.registers[r2 as usize];
 
+        self.registers[r1 as usize] = minuend.wrapping_sub(subtrahend);
+
         if minuend > subtrahend {
             self.registers[0xF] = 1;
         } else {
             self.registers[0xF] = 0;
         }
-
-        self.registers[r1 as usize] = minuend.wrapping_sub(subtrahend);
     }
 
     fn shift_left(&mut self, r1: u8, r2: u8) {
         let _r2 = r2;
 
         let data = self.registers[r1 as usize];
-        self.registers[0xF] = data >> 7;
         self.registers[r1 as usize] = data << 1;
+        self.registers[0xF] = data >> 7;
     }
 
     fn shift_right(&mut self, r1: u8, r2: u8) {
         let _r2 = r2;
 
         let data = self.registers[r1 as usize];
-        self.registers[0xF] = data & 1;
         self.registers[r1 as usize] = data >> 1;
+        self.registers[0xF] = data & 1;
     }
 
     fn and(&mut self, r1: u8, r2: u8) {
@@ -337,17 +360,25 @@ impl Chip8 {
         }
     }
 
-    fn skip_if_key(&mut self, register: u8) {
-        return;
+    fn skip_if_key(&mut self, register: u8, key_events: &Keys) {
+        if let Some(pressed) = key_events.key_pressed(self.registers[register as usize] as usize) {
+            if pressed {
+                self.pc += 2;
+            }
+        }
     }
 
-    fn skip_if_not_key(&mut self, register: u8) {
-        self.pc += 2;
+    fn skip_if_not_key(&mut self, register: u8, key_events: &Keys) {
+        if let Some(pressed) = key_events.key_pressed(self.registers[register as usize] as usize) {
+            if !pressed {
+                self.pc += 2;
+            }
+        }
     }
 
     fn random_and(&mut self, register: u8, operand: u8) {
         let random_number: u8 = rand::random();
-        self.registers[register as usize] = (random_number & operand)
+        self.registers[register as usize] = random_number & operand
     }
 
     fn store(&mut self, register: u8) {
@@ -406,8 +437,6 @@ impl Chip8 {
 }
 
 fn read_program(file_path: &String) -> Result<Vec<u8>, Box<dyn Error>> {
-    // let dir = env::current_dir().unwrap();
-    // println!("Current dir: {dir:?}");
     let buffer = fs::read(file_path)?;
     Ok(buffer)
 }
@@ -419,7 +448,7 @@ fn draw_screen(canvas: &mut Canvas<Window>, program: &Chip8) {
 
     for (i, row) in program.vram.iter().enumerate() {
         for (j, pixel) in row.iter().enumerate() {
-            print!("{pixel}");
+            // print!("{pixel}");
             if *pixel != 0 {
                 canvas
                     .draw_rect(Rect::new(
@@ -434,7 +463,7 @@ fn draw_screen(canvas: &mut Canvas<Window>, program: &Chip8) {
                 //     .expect("Should print");
             }
         }
-        println!("");
+        // println!("");
     }
     canvas.present();
 }
@@ -444,10 +473,12 @@ pub fn main() {
 
     let file_path = &args[1];
 
+    let sdl_context = sdl2::init().unwrap();
+
     let mut program = Chip8::new();
+    let mut input = Input::new(&sdl_context);
     program.load_program(&file_path);
 
-    let sdl_context = sdl2::init().unwrap();
     let video_subsystem = sdl_context.video().unwrap();
 
     let window = video_subsystem
@@ -465,23 +496,10 @@ pub fn main() {
     canvas.set_draw_color(Color::RGB(0, 0, 0));
     canvas.clear();
     canvas.present();
-    let mut event_pump = sdl_context.event_pump().unwrap();
-    'running: loop {
-        for event in event_pump.poll_iter() {
-            match event {
-                Event::Quit { .. }
-                | Event::KeyDown {
-                    keycode: Some(Keycode::Escape),
-                    ..
-                } => break 'running,
-                _ => {}
-            }
-        }
 
-        let instr = program.fetch();
-        println!("Instruction: {instr:x?}");
-        program.decode(instr);
+    while let Some(keys) = input.poll_for_input() {
+        program.proceed(&keys);
         draw_screen(&mut canvas, &program);
-        ::std::thread::sleep(Duration::new(0, 1_000_000_000u32 / 60));
+        ::std::thread::sleep(Duration::new(0, 1_000_000_000u32 / 700));
     }
 }
